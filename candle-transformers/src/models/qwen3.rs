@@ -213,14 +213,26 @@ impl Qwen3Attention {
         // 4. Accumulate KV cache (pre-RoPE for position-independent caching!)
         let (k_pre_rope_cached, v) = self.kv_cache.append(&k_pre_rope, &v)?;
 
-        // 5. Apply RoPE to Q and cached K (position-independent!)
-        let (q, k) = self.rotary_emb.apply(&q, &k_pre_rope_cached, offset)?;
+        // 5. Apply RoPE to Q and full cached K
+        // The cached K has the full sequence, so we need to apply RoPE to all of it
+        let (_, _, cached_seq_len, _) = k_pre_rope_cached.dims4()?;
+        
+        // For Q: apply RoPE at the current position (offset + cached_seq_len - l)
+        let q_pos = offset + cached_seq_len - l;
+        let cos_q = self.rotary_emb.cos.narrow(0, q_pos, l)?;
+        let sin_q = self.rotary_emb.sin.narrow(0, q_pos, l)?;
+        let q = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos_q, &sin_q)?;
+        
+        // For K: apply RoPE to the entire cached sequence starting from offset
+        let cos_k = self.rotary_emb.cos.narrow(0, offset, cached_seq_len)?;
+        let sin_k = self.rotary_emb.sin.narrow(0, offset, cached_seq_len)?;
+        let k = candle_nn::rotary_emb::rope(&k_pre_rope_cached.contiguous()?, &cos_k, &sin_k)?;
 
-        // 6. GQA repeat_kv
+        // 7. GQA repeat_kv
         let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
         let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
 
-        // 7. Attention score
+        // 8. Attention score
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
         if let Some(m) = attn_mask {
@@ -229,7 +241,7 @@ impl Qwen3Attention {
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let ctx = probs.matmul(&v)?; // (B, H, L, D)
 
-        // 8. Output proj
+        // 9. Output proj
         ctx.transpose(1, 2)?
             .reshape((b, l, self.hidden_size))?
             .apply(&self.o_proj)
