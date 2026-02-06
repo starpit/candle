@@ -265,36 +265,32 @@ impl Attention {
             .transpose(1, 2)?
             .contiguous()?;
 
-        // Apply RoPE to query
-        let (_b_sz, _h, q_len, _n_embd) = query_states.dims4()?;
-        let cos_q = self.rotary_emb.cos.narrow(0, seqlen_offset, q_len)?;
-        let sin_q = self.rotary_emb.sin.narrow(0, seqlen_offset, q_len)?;
-        let query_states = candle_nn::rotary_emb::rope(&query_states.contiguous()?, &cos_q, &sin_q)?;
-        
-        // Apply RoPE to new key states
-        let (_b_sz, _h, k_len, _n_embd) = key_states_pre_rope.dims4()?;
-        let cos_k_new = self.rotary_emb.cos.narrow(0, seqlen_offset, k_len)?;
-        let sin_k_new = self.rotary_emb.sin.narrow(0, seqlen_offset, k_len)?;
-        let key_states_new = candle_nn::rotary_emb::rope(&key_states_pre_rope.contiguous()?, &cos_k_new, &sin_k_new)?;
+        // Apply RoPE to query and new key states
+        let (query_states, key_states_new) =
+            self.rotary_emb
+                .apply_rotary_emb_qkv(&query_states, &key_states_pre_rope, seqlen_offset)?;
 
         // Handle KV cache with position-independent caching
-        let (key_states, value_states) = match &self.kv_cache {
-            None => (key_states_new, value_states),
+        let (key_states, value_states, key_states_pre_rope_all) = match &self.kv_cache {
+            None => (key_states_new, value_states.clone(), key_states_pre_rope),
             Some((prev_k_pre_rope, prev_v)) => {
+                // Concatenate pre-RoPE keys first
+                let key_states_pre_rope_all = Tensor::cat(&[prev_k_pre_rope, &key_states_pre_rope], 2)?;
+                
                 // Apply RoPE to cached K with positions starting from 0
-                let (_b_sz, _h, cached_len, _n_embd) = prev_k_pre_rope.dims4()?;
-                let cos_k_cached = self.rotary_emb.cos.narrow(0, 0, cached_len)?;
-                let sin_k_cached = self.rotary_emb.sin.narrow(0, 0, cached_len)?;
-                let prev_k = candle_nn::rotary_emb::rope(&prev_k_pre_rope.contiguous()?, &cos_k_cached, &sin_k_cached)?;
+                let (_b_sz, _h, cached_seq_len, _n_embd) = prev_k_pre_rope.dims4()?;
+                let cos = self.rotary_emb.cos.narrow(0, 0, cached_seq_len)?;
+                let sin = self.rotary_emb.sin.narrow(0, 0, cached_seq_len)?;
+                let prev_k = candle_nn::rotary_emb::rope(&prev_k_pre_rope.contiguous()?, &cos, &sin)?;
                 
                 // Concatenate cached (with RoPE applied) and new K/V
                 let key_states = Tensor::cat(&[&prev_k, &key_states_new], 2)?;
-                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
-                (key_states, value_states)
+                let value_states_all = Tensor::cat(&[prev_v, &value_states], 2)?;
+                (key_states, value_states_all, key_states_pre_rope_all)
             }
         };
         // Cache pre-RoPE K (position-independent!) and V
-        self.kv_cache = Some((key_states_pre_rope.clone(), value_states.clone()));
+        self.kv_cache = Some((key_states_pre_rope_all, value_states.clone()));
 
         let key_states = crate::utils::repeat_kv(key_states, self.num_kv_groups)?;
         let value_states = crate::utils::repeat_kv(value_states, self.num_kv_groups)?;
