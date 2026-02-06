@@ -181,27 +181,18 @@ impl Attention {
             .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // Apply RoPE to query
-        let (_b_sz, _h, q_len, _n_embd) = query_states.dims4()?;
-        let cos_q = self.rotary_emb.cos.narrow(0, seqlen_offset, q_len)?;
-        let sin_q = self.rotary_emb.sin.narrow(0, seqlen_offset, q_len)?;
-        let query_states = candle_nn::rotary_emb::rope(&query_states.contiguous()?, &cos_q, &sin_q)?;
-        
-        // Apply RoPE to new key states
-        let (_b_sz, _h, k_len, _n_embd) = key_states_pre_rope.dims4()?;
-        let cos_k_new = self.rotary_emb.cos.narrow(0, seqlen_offset, k_len)?;
-        let sin_k_new = self.rotary_emb.sin.narrow(0, seqlen_offset, k_len)?;
-        let key_states_new = candle_nn::rotary_emb::rope(&key_states_pre_rope.contiguous()?, &cos_k_new, &sin_k_new)?;
+        // Apply RoPE to query and new key states
+        let (query_states, key_states_new) =
+            self.rotary_emb
+                .apply_rotary_emb_qkv(&query_states, &key_states_pre_rope, seqlen_offset)?;
 
         // Handle KV cache with position-independent caching
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states_new, value_states),
             Some((prev_k_pre_rope, prev_v)) => {
                 // Apply RoPE to cached K with positions starting from 0
-                let (_b_sz, _h, cached_len, _n_embd) = prev_k_pre_rope.dims4()?;
-                let cos_k_cached = self.rotary_emb.cos.narrow(0, 0, cached_len)?;
-                let sin_k_cached = self.rotary_emb.sin.narrow(0, 0, cached_len)?;
-                let prev_k = candle_nn::rotary_emb::rope(&prev_k_pre_rope.contiguous()?, &cos_k_cached, &sin_k_cached)?;
+                let (_dummy_q, prev_k) = self.rotary_emb
+                    .apply_rotary_emb_qkv(&query_states, prev_k_pre_rope, 0)?;
                 
                 // Concatenate cached (with RoPE applied) and new K/V
                 let key_states = Tensor::cat(&[&prev_k, &key_states_new], 2)?;
