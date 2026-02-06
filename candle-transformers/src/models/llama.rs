@@ -5,7 +5,7 @@
 //! Implementation based on Hugging Face's [transformers](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py)
 
 use super::with_tracing::{linear_no_bias as linear, Linear, RmsNorm};
-use candle::{DType, Device, IndexOp, Result, Tensor, D};
+use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{embedding, Embedding, Module, VarBuilder};
 use std::{collections::HashMap, f32::consts::PI};
 
@@ -286,7 +286,7 @@ impl CausalSelfAttention {
             .reshape((b_sz, seq_len, self.num_attention_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
-        let k = k
+        let k_pre_rope = k
             .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
@@ -294,35 +294,46 @@ impl CausalSelfAttention {
             .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
             .transpose(1, 2)?;
 
+        // Apply RoPE to Q
         let q = self.apply_rotary_emb(&q, index_pos, cache)?;
-        let mut k = self.apply_rotary_emb(&k, index_pos, cache)?;
+        
+        // Apply RoPE to new K tokens
+        let k_new = self.apply_rotary_emb(&k_pre_rope, index_pos, cache)?;
 
+        // Handle KV cache with position-independent caching
+        let mut k = k_new;
         if cache.use_kv_cache {
-            if let Some((cache_k, cache_v)) = &cache.kvs[block_idx] {
-                k = Tensor::cat(&[cache_k, &k], 2)?.contiguous()?;
+            if let Some((cache_k_pre_rope, cache_v)) = &cache.kvs[block_idx] {
+                // Apply RoPE to cached K with positions starting from 0
+                let cache_k = self.apply_rotary_emb(cache_k_pre_rope, 0, cache)?;
+                
+                // Concatenate cached (with RoPE applied) and new K/V
+                k = Tensor::cat(&[&cache_k, &k], 2)?.contiguous()?;
                 v = Tensor::cat(&[cache_v, &v], 2)?.contiguous()?;
-                let k_seq_len = k.dims()[1];
+                
+                let k_seq_len = k.dims()[2];
                 if k_seq_len > self.max_position_embeddings {
                     k = k
                         .narrow(
-                            D::Minus1,
+                            2,
                             k_seq_len - self.max_position_embeddings,
                             self.max_position_embeddings,
                         )?
                         .contiguous()?
                 }
-                let v_seq_len = v.dims()[1];
-                if v_seq_len > 2 * self.max_position_embeddings {
+                let v_seq_len = v.dims()[2];
+                if v_seq_len > self.max_position_embeddings {
                     v = v
                         .narrow(
-                            D::Minus1,
+                            2,
                             v_seq_len - self.max_position_embeddings,
                             self.max_position_embeddings,
                         )?
                         .contiguous()?
                 }
             }
-            cache.kvs[block_idx] = Some((k.clone(), v.clone()))
+            // Cache pre-RoPE K (position-independent!) and V
+            cache.kvs[block_idx] = Some((k_pre_rope.clone(), v.clone()))
         }
 
         let k = self.repeat_kv(k)?;

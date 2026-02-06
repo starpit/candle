@@ -174,26 +174,34 @@ impl Attention {
         let query_states = query_states
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let key_states = key_states
+        let key_states_pre_rope = key_states
             .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
         let value_states = value_states
             .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        let (query_states, key_states) =
+        // Apply RoPE to query and new key states
+        let (query_states, key_states_new) =
             self.rotary_emb
-                .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
+                .apply_rotary_emb_qkv(&query_states, &key_states_pre_rope, seqlen_offset)?;
 
+        // Handle KV cache with position-independent caching
         let (key_states, value_states) = match &self.kv_cache {
-            None => (key_states, value_states),
-            Some((prev_k, prev_v)) => {
-                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
+            None => (key_states_new, value_states),
+            Some((prev_k_pre_rope, prev_v)) => {
+                // Apply RoPE to cached K with positions starting from 0
+                let (_query_dummy, prev_k) = self.rotary_emb
+                    .apply_rotary_emb_qkv(&query_states, prev_k_pre_rope, 0)?;
+                
+                // Concatenate cached (with RoPE applied) and new K/V
+                let key_states = Tensor::cat(&[&prev_k, &key_states_new], 2)?;
                 let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
                 (key_states, value_states)
             }
         };
-        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+        // Cache pre-RoPE K (position-independent!) and V
+        self.kv_cache = Some((key_states_pre_rope.clone(), value_states.clone()));
 
         let key_states = crate::utils::repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
         let value_states =

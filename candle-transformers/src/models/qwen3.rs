@@ -195,7 +195,7 @@ impl Qwen3Attention {
         let q = q
             .reshape((b, l, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let k = k
+        let k_pre_rope = k
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
         let v = v
@@ -204,17 +204,17 @@ impl Qwen3Attention {
 
         // 3. Per‑head RMSNorm
         let q_flat = q.flatten(0, 2)?; // (B*H, L, D) -> (BHL, D) after transpose later
-        let k_flat = k.flatten(0, 2)?;
+        let k_flat = k_pre_rope.flatten(0, 2)?;
         let q_flat = self.q_norm.forward(&q_flat)?;
         let k_flat = self.k_norm.forward(&k_flat)?;
         let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
-        let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
+        let k_pre_rope = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
 
-        // 4. RoPE
-        let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
+        // 4. Accumulate KV cache (pre-RoPE for position-independent caching!)
+        let (k_pre_rope_cached, v) = self.kv_cache.append(&k_pre_rope, &v)?;
 
-        // 5. Accumulate KV cache
-        let (k, v) = self.kv_cache.append(&k, &v)?;
+        // 5. Apply RoPE to Q and cached K (position-independent!)
+        let (q, k) = self.rotary_emb.apply(&q, &k_pre_rope_cached, offset)?;
 
         // 6. GQA repeat_kv
         let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
