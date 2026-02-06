@@ -303,7 +303,10 @@ impl CausalSelfAttention {
         // Handle KV cache with position-independent caching
         let mut k = k_new;
         if cache.use_kv_cache {
-            if let Some((cache_k_pre_rope, cache_v)) = &cache.kvs[block_idx] {
+            let k_pre_rope_all = if let Some((cache_k_pre_rope, cache_v)) = &cache.kvs[block_idx] {
+                // Concatenate pre-RoPE keys first
+                let k_pre_rope_all = Tensor::cat(&[cache_k_pre_rope, &k_pre_rope], 2)?;
+                
                 // Apply RoPE to cached K with positions starting from 0
                 let cache_k = self.apply_rotary_emb(cache_k_pre_rope, 0, cache)?;
                 
@@ -331,9 +334,12 @@ impl CausalSelfAttention {
                         )?
                         .contiguous()?
                 }
-            }
+                k_pre_rope_all
+            } else {
+                k_pre_rope
+            };
             // Cache pre-RoPE K (position-independent!) and V
-            cache.kvs[block_idx] = Some((k_pre_rope.clone(), v.clone()))
+            cache.kvs[block_idx] = Some((k_pre_rope_all, v.clone()))
         }
 
         let k = self.repeat_kv(k)?;
